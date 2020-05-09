@@ -393,6 +393,46 @@ compute_align_vector(SDL_PixelFormat *format, int color_offset,
                          output_align[2], output_align[3]);
 }
 
+const uint8_t populate_alpha[16] SSE42_ALIGN = {
+	/* 0 1 2 3 4 5 6 7 8 9 a b c d e f */
+	/* r g b A r g b A ............... */
+	0xff, 0x3, 0xff, 0x3, 0xff, 0x3, 0xff, 0xff,
+	0xff, 0x7, 0xff, 0x7, 0xff, 0x7, 0xff, 0xff,
+	/* 0 A 0 A 0 A 0 0 0 A 0 A 0 A 0 0 */
+};
+
+const uint8_t original_alpha[16] SSE42_ALIGN = {
+	/* 0 1 2 3 4 5 6 7 8 9 a b c d e f */
+	/* r g b A r g b A r g b A r g b A */
+	0xff, 0xff, 0xff, 0x03, 0xff, 0xff, 0xff, 0x07,
+	0xff, 0xff, 0xff, 0x0b, 0xff, 0xff, 0xff, 0x0f,
+	/*  0 0 0 A 0 0 0 A 0 0 0 A 0 0 0 A */
+};
+
+
+static PG_INLINE void
+compute_alpha_extraction_vector(SDL_PixelFormat *format,
+                                __m128i *alpha_extraction,
+                                __m128i *orig_alpha)
+{
+    *alpha_extraction = _mm_loadu_si128((const __m128i*)(void *)populate_alpha);
+    *orig_alpha = _mm_loadu_si128((const __m128i*)(void *)original_alpha);
+
+}
+
+/*
+ * Divide each element of a SSE vector consisting of unsigned 16bit integers
+ * with the value 255.
+ * Source:
+ * https://stackoverflow.com/questions/35285324/how-to-divide-16-bit-integer-by-255-with-using-sse/35285458#35285458
+ */
+static PG_INLINE __m128i
+_sse_16bit_divide_by_255(__m128i value)
+{
+    return _mm_srli_epi16(_mm_add_epi16(
+        _mm_add_epi16(value, _mm_set1_epi16(1)), _mm_srli_epi16(value, 8)), 8);
+}
+
 /*
  * SSE4.2 variant of tostring_surf_32bpp.
  *
@@ -401,7 +441,7 @@ compute_align_vector(SDL_PixelFormat *format, int color_offset,
  */
 static PG_INLINE void
 tostring_surf_32bpp_sse42(SDL_Surface *surf, int flipped, char *out,
-                          int color_offset, int alpha_offset) {
+                          int premult, int color_offset, int alpha_offset) {
     const int step_size = 4;
     int h, w;
     SDL_PixelFormat *format = surf->format;
@@ -432,17 +472,97 @@ tostring_surf_32bpp_sse42(SDL_Surface *surf, int flipped, char *out,
     assert(format->Bloss % 8 == 0);
     assert(format->Aloss % 8 == 0);
 
-    for (h = 0; h < surf->h; ++h) {
-        const __m128i *row = (const __m128i*)(void *)DATAROW(
-            surf->pixels, h, surf->pitch, surf->h, flipped);
-        for (w = 0; w < loop_max; ++w) {
-            __m128i pvector = _mm_loadu_si128(row++);
-            DEBUG_PRINT128_NUM(pvector, "Load");
-            pvector = _mm_and_si128(pvector, mask_vector);
-            DEBUG_PRINT128_NUM(pvector, "after _mm_and_si128 (and)");
-            pvector = _mm_shuffle_epi8(pvector, align_vector);
-            DEBUG_PRINT128_NUM(pvector, "after _mm_shuffle_epi8 (reorder)");
-            _mm_storeu_si128(data++, pvector);
+    if (premult) {
+        __m128i alpha_extraction, orig_alpha_extraction;
+        compute_alpha_extraction_vector(format, &alpha_extraction,
+                                        &orig_alpha_extraction);
+        /* The alpha extractions assume that the alpha byte is
+         * placed at a specific place.
+         */
+        assert(format->Ashift == 0);
+
+        for (h = 0; h < surf->h; ++h) {
+            const __m128i *row = (const __m128i*)(void *)DATAROW(
+                surf->pixels, h, surf->pitch, surf->h, flipped);
+            for (w = 0; w < loop_max; ++w) {
+                __m128i result;
+                __m128i alpha_p12, alpha_p34;
+                __m128i pvector_packed = _mm_loadu_si128(row++);
+                __m128i pvector_p12, pvector_p34;
+                __m128i orig_alpha;
+                DEBUG_PRINT128_NUM(pvector_packed, "Load unmasked     1-4");
+                pvector_packed = _mm_and_si128(pvector_packed, mask_vector);
+                DEBUG_PRINT128_NUM(pvector_packed, "Load masked       1-4");
+                pvector_p12 = pvector_packed;
+                pvector_p34 = _mm_castps_si128(_mm_movehl_ps(
+                                                _mm_castsi128_ps(pvector_packed),
+                                                _mm_castsi128_ps(pvector_packed)
+                                      ));
+                orig_alpha = _mm_shuffle_epi8(pvector_packed,
+                                              orig_alpha_extraction);
+                DEBUG_PRINT128_NUM(pvector_p12, "Load              1-2");
+                DEBUG_PRINT128_NUM(pvector_p34, "Load + re-aligned 3-4");
+
+
+                alpha_p12 = _mm_shuffle_epi8(pvector_p12, alpha_extraction);
+                alpha_p34 = _mm_shuffle_epi8(pvector_p34, alpha_extraction);
+                DEBUG_PRINT128_NUM(alpha_p12, "Alpha vector 1-2");
+                DEBUG_PRINT128_NUM(alpha_p34, "Alpha vector 3-4");
+
+                /* Expand the pixel bytes to 16bit integers as SSE4.2 can only
+                 * multiply with 16 bit integers
+                 */
+                pvector_p12 = _mm_slli_epi16(_mm_cvtepu8_epi16(pvector_p12), 8);
+                pvector_p34 = _mm_slli_epi16(_mm_cvtepu8_epi16(pvector_p34), 8);
+                DEBUG_PRINT128_NUM(pvector_p12, "Extension 1-2");
+                DEBUG_PRINT128_NUM(pvector_p34, "Extension 3-4");
+
+                /* This multiplies and discards the lower 16 bits - this
+                 * happen to be fine for us as we align the numbers so
+                 * there are only 0 bits being lost.
+                 *
+                 * This is bit is basically: COLOR * ALPHA
+                 */
+                DEBUG_PRINT128_NUM(pvector_p12, "MULTI  P1-2");
+                DEBUG_PRINT128_NUM(alpha_p12, "ALPHA  P1-2");
+                pvector_p12 = _mm_mulhi_epu16(pvector_p12, alpha_p12);
+                pvector_p34 = _mm_mulhi_epu16(pvector_p34, alpha_p34);
+                DEBUG_PRINT128_NUM(pvector_p12, "RES    P1-2");
+
+                pvector_p12 = _sse_16bit_divide_by_255(pvector_p12);
+                pvector_p34 = _sse_16bit_divide_by_255(pvector_p34);
+
+                DEBUG_PRINT128_NUM(pvector_p12, "RES/255 1-2");
+
+                DEBUG_PRINT128_NUM(pvector_p12, "Multiplied with alpha 1-2");
+                DEBUG_PRINT128_NUM(pvector_p34, "Multiplied with alpha 3-4");
+
+                /* Repack the 16bits into bytes */
+                result = _mm_packus_epi16(pvector_p12, pvector_p34);
+                DEBUG_PRINT128_NUM(result, "Result repacked (no alpha)");
+
+                DEBUG_PRINT128_NUM(orig_alpha, "Original alpha 1-4");
+                result = _mm_or_si128(result, orig_alpha);
+                DEBUG_PRINT128_NUM(result, "Result repacked (OR'ed w. alpha)");
+
+                result = _mm_shuffle_epi8(result, align_vector);
+                DEBUG_PRINT128_NUM(result, "after _mm_shuffle_epi8 (reorder)");
+                _mm_storeu_si128(data++, result);
+            }
+        }
+    } else {
+        for (h = 0; h < surf->h; ++h) {
+            const __m128i *row = (const __m128i*)(void *)DATAROW(
+                surf->pixels, h, surf->pitch, surf->h, flipped);
+            for (w = 0; w < loop_max; ++w) {
+                __m128i pvector = _mm_loadu_si128(row++);
+                DEBUG_PRINT128_NUM(pvector, "Load");
+                pvector = _mm_and_si128(pvector, mask_vector);
+                DEBUG_PRINT128_NUM(pvector, "after _mm_and_si128 (and)");
+                pvector = _mm_shuffle_epi8(pvector, align_vector);
+                DEBUG_PRINT128_NUM(pvector, "after _mm_shuffle_epi8 (reorder)");
+                _mm_storeu_si128(data++, pvector);
+            }
         }
     }
 }
@@ -490,7 +610,6 @@ tostring_surf_32bpp(SDL_Surface *surf, int flipped,
         sizeof(int) == sizeof(Uint32)
         && 4 * sizeof(Uint32) == sizeof(__m128i)
         && !hascolorkey /* No color key */
-        && !premult /* premult not supported */
         && SDL_HasSSE42() == SDL_TRUE
         && surf->w % 4 == 0 /* No unaligned parts */
         /* Our SSE code assumes masks are at most 0xff */
@@ -509,7 +628,7 @@ tostring_surf_32bpp(SDL_Surface *surf, int flipped,
         && (Aloss % 8) == 0
         ) {
         tostring_surf_32bpp_sse42(surf, flipped, serialized_image,
-                                  color_offset, alpha_offset);
+                                  premult, color_offset, alpha_offset);
         return;
     }
 #endif
