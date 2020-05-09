@@ -448,14 +448,14 @@ tostring_surf_32bpp_sse42(SDL_Surface *surf, int flipped, char *out,
 static void
 tostring_surf_32bpp(SDL_Surface *surf, int flipped,
                     int hascolorkey, Uint32 colorkey,
-                    char *serialized_image,
+                    char *serialized_image, int premult,
                     int color_offset, int alpha_offset
 )
 #else
 static void
 tostring_surf_32bpp(SDL_Surface *surf, int flipped,
                     int hascolorkey, int colorkey,
-                    char *serialized_image,
+                    char *serialized_image, int premult,
                     int color_offset, int alpha_offset
 )
 #endif /* !IS_SDLv2*/
@@ -485,6 +485,7 @@ tostring_surf_32bpp(SDL_Surface *surf, int flipped,
         sizeof(int) == sizeof(Uint32)
         && 4 * sizeof(Uint32) == sizeof(__m128i)
         && !hascolorkey /* No color key */
+        && !premult /* premult not supported */
         && SDL_HasSSE42() == SDL_TRUE
         && surf->w % 4 == 0 /* No unaligned parts */
         /* Our SSE code assumes masks are at most 0xff */
@@ -511,21 +512,45 @@ tostring_surf_32bpp(SDL_Surface *surf, int flipped,
     for (h = 0; h < surf->h; ++h) {
         Uint32 *pixel_row = (Uint32 *)DATAROW(
             surf->pixels, h, surf->pitch, surf->h, flipped);
-        for (w = 0; w < surf->w; ++w) {
-            Uint32 color = *pixel_row++;
-            serialized_image[color_offset + 0] =
-                 (char)(((color & Rmask) >> Rshift) << Rloss);
-            serialized_image[color_offset + 1] =
-                 (char)(((color & Gmask) >> Gshift) << Gloss);
-            serialized_image[color_offset + 2] =
-                 (char)(((color & Bmask) >> Bshift) << Bloss);
-            serialized_image[alpha_offset] =
-                hascolorkey
-                    ? (char)(color != colorkey) * 255
-                    : (char)(Amask ? (((color & Amask) >> Ashift)
-                                      << Aloss)
-                                   : 255);
-            serialized_image += 4;
+        if (premult) {
+            for (w = 0; w < surf->w; ++w) {
+                Uint32 color = *pixel_row++;
+                Uint32 alpha = ((color & Amask) >> Ashift) << Aloss;
+                if (alpha == 0) {
+                    serialized_image[color_offset + 0] = 0;
+                    serialized_image[color_offset + 1] = 0;
+                    serialized_image[color_offset + 2] = 0;
+                } else {
+                    serialized_image[color_offset + 0] =
+                        (char)((((color & Rmask) >> Rshift) << Rloss) *
+                               alpha / 255);
+                    serialized_image[color_offset + 1] =
+                        (char)((((color & Gmask) >> Gshift) << Gloss) *
+                               alpha / 255);
+                    serialized_image[color_offset + 2] =
+                        (char)((((color & Bmask) >> Bshift) << Bloss) *
+                               alpha / 255);
+                }
+                serialized_image[alpha_offset] = (char)alpha;
+                serialized_image += 4;
+            }
+        } else {
+            for (w = 0; w < surf->w; ++w) {
+                Uint32 color = *pixel_row++;
+                serialized_image[color_offset + 0] =
+                     (char)(((color & Rmask) >> Rshift) << Rloss);
+                serialized_image[color_offset + 1] =
+                     (char)(((color & Gmask) >> Gshift) << Gloss);
+                serialized_image[color_offset + 2] =
+                     (char)(((color & Bmask) >> Bshift) << Bloss);
+                serialized_image[alpha_offset] =
+                    hascolorkey
+                        ? (char)(color != colorkey) * 255
+                        : (char)(Amask ? (((color & Amask) >> Ashift)
+                                          << Aloss)
+                                       : 255);
+                serialized_image += 4;
+            }
         }
     }
 }
@@ -752,7 +777,7 @@ image_tostring(PyObject *self, PyObject *arg)
                 break;
             case 4:
                 tostring_surf_32bpp(surf, flipped, hascolorkey, colorkey,
-                                    data, 0, 3);
+                                    data, 0, 0, 3);
                 break;
         }
         pgSurface_Unlock(surfobj);
@@ -822,7 +847,7 @@ image_tostring(PyObject *self, PyObject *arg)
                 break;
             case 4:
                 tostring_surf_32bpp(surf, flipped, hascolorkey, colorkey,
-                                    data, 1, 0);
+                                    data, 0, 1, 0);
                 break;
         }
         pgSurface_Unlock(surfobj);
@@ -892,30 +917,8 @@ image_tostring(PyObject *self, PyObject *arg)
                 }
                 break;
             case 4:
-                for (h = 0; h < surf->h; ++h) {
-                    Uint32 *ptr = (Uint32 *)DATAROW(
-                        surf->pixels, h, surf->pitch, surf->h, flipped);
-                    for (w = 0; w < surf->w; ++w) {
-                        color = *ptr++;
-                        alpha = ((color & Amask) >> Ashift) << Aloss;
-                        if (alpha == 0) {
-                            data[0] = data[1] = data[2] = 0;
-                        }
-                        else {
-                            data[0] =
-                                (char)((((color & Rmask) >> Rshift) << Rloss) *
-                                       alpha / 255);
-                            data[1] =
-                                (char)((((color & Gmask) >> Gshift) << Gloss) *
-                                       alpha / 255);
-                            data[2] =
-                                (char)((((color & Bmask) >> Bshift) << Bloss) *
-                                       alpha / 255);
-                        }
-                        data[3] = (char)alpha;
-                        data += 4;
-                    }
-                }
+                tostring_surf_32bpp(surf, flipped, hascolorkey, colorkey,
+                                    data, 1, 0, 3);
                 break;
         }
         pgSurface_Unlock(surfobj);
