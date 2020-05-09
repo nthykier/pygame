@@ -328,10 +328,15 @@ image_get_extended(PyObject *self, PyObject *arg)
 /* Useful for debugging/comparing the SSE vectors */
 static void _debug_print128_num(__m128i var, const char *msg)
 {
-    uint32_t val[4];
+    uint8_t val[16];
     memcpy(val, &var, sizeof(val));
-    fprintf(stderr, "%s: %04x%04x%04x%04x\n",
-           msg, val[0], val[1], val[2], val[3]);
+    fprintf(stderr, "%s: %02x%02x%02x%02x %02x%02x%02x%02x   %02x%02x%02x%02x %02x%02x%02x%02x\n",
+           msg,
+           val[0], val[1], val[2], val[3],
+           val[4], val[5], val[6], val[7],
+           val[8], val[9], val[10], val[11],
+           val[12], val[13], val[14], val[15]
+           );
 }
 #define DEBUG_PRINT128_NUM(var, msg) _debug_print128_num(var, msg)
 #else
