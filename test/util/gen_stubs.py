@@ -1,3 +1,5 @@
+from __future__ import print_function
+
 usage_text = """
 $ %prog ROOT
 
@@ -31,7 +33,13 @@ for relpath in ('../../','../'):
     sys.path.insert(0, abspath(normpath( join(dirname(__file__), relpath) )) )
 
 from unittest import TestCase
-from makeref import docs_as_dict
+
+try:
+    from makeref import docs_as_dict
+except ImportError:
+    def docs_as_dict():
+        raise NotImplementedError("not ported")
+
 from test_utils import trunk_relative_path
 
 #################################### IGNORES ###################################
@@ -104,7 +112,7 @@ def get_instance(type_):
 
     try:
         return helper(*arg)
-    except Exception, e:
+    except Exception as e:
         raw_input("FAILED TO CREATE INSTANCE OF %s\n%s\n" 
                   "Press Enter to continue" % (type_, e))
         return type_
@@ -353,8 +361,8 @@ if __name__ == "__main__":
         if not fname.startswith(root): continue  # eg. module.Class
         test_name, stub = stubs[fname]
 
-        if options.list: print "%s," % fname
-        elif options.test_names: print test_name
-        else: print stub
+        if options.list: print("%s," % fname)
+        elif options.test_names: print(test_name)
+        else: print(stub)
 
 ################################################################################
